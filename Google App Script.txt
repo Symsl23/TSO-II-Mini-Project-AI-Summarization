@@ -1,0 +1,173 @@
+// ========== 1. Receive sensor data via HTTP POST ==========
+function doPost(e) {
+  return handleResponse(e);
+}
+
+function handleResponse(e) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+
+  try {
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("SensorData");
+    if (!sheet) {
+      sheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("SensorData");
+      sheet.appendRow(["Timestamp", "Temperature", "Humidity", "Status", "Alert", "Retries"]);
+    }
+
+    var payload = JSON.parse(e.postData.contents);
+    var timestamp = new Date();
+    var data = [
+      timestamp,
+      payload.temperature || "",
+      payload.humidity || "",
+      payload.status || "",
+      payload.alert || "",
+      payload.retries !== undefined ? payload.retries : ""
+    ];
+
+    sheet.appendRow(data);
+
+    return ContentService.createTextOutput(JSON.stringify({
+      status: "success",
+      timestamp: timestamp.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({
+      status: "error",
+      message: err.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ========== 2. Forecast Function ==========
+function forecastTemperatureHumiditySMA() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const tempData = sheet.getRange("B2:B97").getValues().flat();
+  const humData = sheet.getRange("C2:C97").getValues().flat();
+  const windowSize = 5;
+
+  for (let i = 48; i < 96; i++) {
+    if (i < windowSize) continue;
+
+    const tempWindow = tempData.slice(i - windowSize, i);
+    const tempAvg = tempWindow.reduce((a, b) => a + b, 0) / windowSize;
+    const tempUpper = tempAvg + 1.5;
+    const tempLower = tempAvg - 1.5;
+
+    const humWindow = humData.slice(i - windowSize, i);
+    const humAvg = humWindow.reduce((a, b) => a + b, 0) / windowSize;
+    const humUpper = humAvg + 5;
+    const humLower = humAvg - 5;
+
+    const row = i + 2;
+    sheet.getRange(row, 4).setValue(tempAvg.toFixed(1));
+    sheet.getRange(row, 5).setValue(tempUpper.toFixed(1));
+    sheet.getRange(row, 6).setValue(tempLower.toFixed(1));
+    sheet.getRange(row, 7).setValue(humAvg.toFixed(1));
+    sheet.getRange(row, 8).setValue(humUpper.toFixed(1));
+    sheet.getRange(row, 9).setValue(humLower.toFixed(1));
+  }
+}
+
+// ========== 3. Gemini API Call with Script Properties ==========
+function summarizeWithGemini(userPrompt) {
+  if (!userPrompt || userPrompt.trim() === "") {
+    return "Prompt is empty. Cannot summarize.";
+  }
+
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey) {
+    return "API key not found in script properties.";
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+  const payload = {
+    contents: [
+      {
+        parts: [{ text: userPrompt }]
+      }
+    ]
+  };
+
+  const options = {
+    method: "POST",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(url, options);
+    const resultText = response.getContentText();
+    Logger.log("Gemini response: " + resultText);
+    const result = JSON.parse(resultText);
+
+    if (result && result.candidates && result.candidates.length > 0) {
+      return result.candidates[0].content.parts[0].text;
+    } else {
+      return "Failed to retrieve summary from Gemini API.";
+    }
+  } catch (error) {
+    Logger.log("Gemini API Error: " + error.toString());
+    return "Error calling Gemini API.";
+  }
+}
+
+function insertAISummaryToSheet() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Forecast data");
+  if (!sheet) {
+    Logger.log("Sheet 'Forecast data' not found.");
+    return;
+  }
+
+  // Read timestamp, temperature, and humidity from row 2 to 97
+  const dataRange = sheet.getRange("A2:C97").getValues(); // A: Timestamp, B: Temp, C: Humidity
+  let formattedData = "Timestamp\t\t| Temperature (°C)\t| Humidity (%)\n";
+  formattedData += "---------------------|-------------------|--------------\n";
+
+  dataRange.forEach(row => {
+    const timestamp = row[0] ? Utilities.formatDate(new Date(row[0]), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm") : "";
+    const temp = row[1];
+    const hum = row[2];
+    if (timestamp && temp !== "" && hum !== "") {
+      formattedData += `${timestamp}\t| ${temp.toFixed(1)}\t\t\t| ${hum.toFixed(1)}\n`;
+    }
+  });
+
+  const prompt = `Here is the timestamped temperature and humidity data from rows 2 to 97:\n\n${formattedData}\n\nPlease analyze and summarize any patterns, trends, or anomalies you observe. Provide your insights clearly, making summarize in one paragraph Format each sentence or insight on a new line using line breaks. Mention specific times if there are noticeable changes. And make forest data for the next two day`;
+
+  const summaryText = summarizeWithGemini(prompt); // Replace with actual Gemini API call
+
+  // Insert AI Summary Prompt and Response headers if not already present
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  let aiPromptCol = headers.indexOf("AI Summary Prompt") + 1;
+  let aiResponseCol = headers.indexOf("AI Summary Response") + 1;
+
+  if (aiPromptCol === 0) {
+    sheet.getRange(1, headers.length + 1).setValue("AI Summary Prompt");
+    aiPromptCol = headers.length + 1;
+  }
+  if (aiResponseCol === 0) {
+    const offset = (aiPromptCol === headers.length + 1) ? 2 : 1;
+    sheet.getRange(1, headers.length + offset).setValue("AI Summary Response");
+    aiResponseCol = headers.length + offset;
+  }
+
+  // Append new summary to the next available row
+  const lastRow = sheet.getLastRow() + 1;
+  sheet.getRange(lastRow, aiPromptCol).setValue(prompt);
+  sheet.getRange(lastRow, aiResponseCol).setValue(summaryText);
+
+  Logger.log("AI summary with timestamped data added.");
+}
+
+
+
+// ========== 5. Test Trigger ==========
+//function testAISummaryInsert() {
+  //const prompt = "Summarize the data in sheet forecast data.";
+  //insertAISummaryToSheet(prompt);
